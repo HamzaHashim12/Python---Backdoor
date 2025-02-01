@@ -175,7 +175,7 @@ File Transfer Examples:
 def shell():
     while True:
         try:
-            command = input(termcolor.colored("fsociety> ", "blue")).strip()
+            command = input(termcolor.colored("#-cipher-Ducky >> ", "blue")).strip()
             if not command:
                 continue
 
@@ -233,7 +233,7 @@ def main():
             target, ip = server.accept()
             print(termcolor.colored(f"\n[+] Target connected from {ip[0]}:{ip[1]}", "green"))
 
-            ascii_art = text2art("FSOCIETY", "random")
+            ascii_art = text2art("CIPHER DUCKY", "random")
             print(termcolor.colored(ascii_art, "red"))
             print_help()
 
